@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# hyperparams
+# --hyperparams--
 batch_size = 32 # independent sequences processed in parallel
+# previous 8 tokens predict 9th token
 block_size = 8 # max context length
-max_iters = 3000 # total num iterations of training 
+max_iters = 5000 # total num iterations of training 
 eval_interval = 300 # how often we check loss during training
 eval_iters = 200
 learning_rate = 1e-2
@@ -14,19 +15,21 @@ learning_rate = 1e-2
 
 torch.manual_seed(1337)
 
-# read into text
+# read input shakespearan text
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
 # print(len(text))
 # print(text[:100])
 
+# get the vocab by sorting the set of the input text (str)
+# set eliminates duplicates
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
 # print(vocab_size)
 # print(''.join(chars))
 
-# map char to string by index in the chars list
-# does this choice of embedding matter?
+# map char (str) to integer by index in the chars list
+# ambigous ordering, losing a data dimension in proximity?
 # tradeoff between size of vocab and dimension of embedding
 ctoi = {ch:i for i,ch in enumerate(chars)}
 itoc = {i:ch for i,ch in enumerate(chars)}
@@ -63,7 +66,7 @@ def get_batch(split):
 
 # xb, yb = get_batch('train')
 
-@torch.no_grad() # never call backprop, efficiency 
+@torch.no_grad() # tell pytorch we won't call backprop, efficiency 
 def estimate_loss():
     out = {}
     m.eval()
@@ -79,7 +82,7 @@ def estimate_loss():
 
 class BigramLanguageModel(nn.Module):
   
-  def __init__(self, vocab_size):
+  def __init__(self):
     super().__init__()
     # embedding table W = matrix (vocab_size, vocab_size)
     # each token reads off logits (unnormalized scores) for next token via lookup table
@@ -117,7 +120,7 @@ class BigramLanguageModel(nn.Module):
       # append sampled index to running sequence
       idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
     return idx
-m = BigramLanguageModel(vocab_size)
+m = BigramLanguageModel()
 
 # 1x1 tensor holding a 0, kickoff character
 idx = torch.zeros((1, 1), dtype=torch.long)
