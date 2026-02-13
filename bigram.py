@@ -3,17 +3,19 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # --hyperparams--
-batch_size = 32 # independent sequences processed in parallel
+batch_size = 64 # independent sequences processed in parallel
 # previous 8 tokens predict 9th token
-block_size = 8 # max context length
+block_size = 256 # max context length
 max_iters = 5000 # total num iterations of training 
-eval_interval = 300 # how often we check loss during training
+eval_interval = 500 # how often we check loss during training
 eval_iters = 200 
-learning_rate = 1e-3
-n_embd = 32 # embedding dimensions
-# no gpu RIP
-# device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
+learning_rate = 3e-4
+n_embd = 128 # embedding dimensions
+n_layer = 4
+n_head = 4
+dropout = 0.2 # randomly sever connections during training -> ensemble
+device = 'cuda' if torch.cuda.is_available() else 'cpu' # tragically untouched
+print(f"Device: {device}")
 torch.manual_seed(1337)
 
 # read input shakespearan text
@@ -63,6 +65,7 @@ def get_batch(split):
   # 32 examples, x and y just hold the end points
   x = torch.stack([data[i:i+block_size] for i in ix])
   y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+  x,y = x.to(device), y.to(device)
   return x,y
 
 # xb, yb = get_batch('train')
@@ -81,12 +84,29 @@ def estimate_loss():
     m.train()
     return out
 
+# # normalizes rows
+# class LayerNorma1d:
+#   def __init__(self, dim, eps=1e-5):
+#     self.eps = eps
+#     self.gamma = torch.ones(dim)
+#     self.beta = torch.zeros(dim)
+#   def __call__(self, x):
+#     xmean = x.mean(1, keepdim=True) # batch mean
+#     xvar = x.var(1, keepdim=True) # batch var
+#     xhat = (x-xmean)/torch.sqrt(xvar+self.eps) # normalize to unit var
+#     self.out = self.gamma * xhat + self.beta
+#     return self.out
+#   def parameters(self):
+#     return [self.gamma, self.beta]
+
+
 class Head(nn.Module):
   def __init__(self, head_size):
     super().__init__()
     self.key = nn.Linear(n_embd, head_size, bias=False)
     self.query = nn.Linear(n_embd, head_size, bias=False)
     self.value = nn.Linear(n_embd, head_size, bias=False)
+    self.dropout = nn.Dropout(dropout)
     # tril is not a param of model, it's a buffer
     self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
   def forward(self, x):
@@ -97,45 +117,58 @@ class Head(nn.Module):
     wei = q @ k.transpose(-2, -1) * C**-0.5
     wei = wei.masked_fill(self.tril[:T, :T]==0, float('-inf'))
     wei = F.softmax(wei, dim=-1)
+    wei = self.dropout(wei)
     out = wei @ v
     return out
   
 class MultiHeadAttention(nn.Module):
-  def __init__(self, num_heads, head_size):
+  def __init__(self, n_head, head_size):
     super().__init__()
-    self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+    head_size = n_embd // n_head
+    self.heads = nn.ModuleList([Head(head_size) for _ in range(n_head)])
+    self.proj = nn.Linear(n_embd, n_embd)
+    self.dropout = nn.Dropout(dropout)
   def forward(self, x):
-     return torch.cat([h(x) for h in self.heads], dim=-1)
+    out = torch.cat([h(x) for h in self.heads], dim=-1)
+    return self.dropout(self.proj(out)) # project layer outcome back onto main highway
     
 # done independently on a token-level basis
 class FeedForward(nn.Module):
   def __init__(self, n_embd):
     super().__init__()
     self.net = nn.Sequential(
-        nn.Linear(n_embd, n_embd),
+        nn.Linear(n_embd, 4 * n_embd), # x4dim from OG paper
         nn.ReLU(),
+        nn.Linear(4 * n_embd, n_embd),
+        nn.Dropout(dropout),
     )
   def forward(self, x):
     return self.net(x)
-    
+
+class Block(nn.Module):
+  def __init__(self, n_embd, n_head):
+    super().__init__()
+    head_size = n_embd // n_head
+    self.sa = MultiHeadAttention(n_head, head_size)
+    self.ffwd = FeedForward(n_embd)
+    self.ln1 = nn.LayerNorm(n_embd)
+    self.ln2 = nn.LayerNorm(n_embd)
+  def forward(self, x):
+    # residual streams enable clean backprop
+    x = x + self.sa(self.ln1(x))
+    x = x + self.ffwd(self.ln2(x))
+    return x
 
 class BigramLanguageModel(nn.Module):
   
   def __init__(self):
     super().__init__()
-    # embedding table W = matrix (vocab_size, vocab_size)
-    # each token reads off logits (unnormalized scores) for next token via lookup table
-    # row i of W contains logits for distr of next token given current token = i
-    # this is the entire model bro
-    # self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
-
-    # decompose 
     self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-    # positional encoding
     self.position_embedding_table = nn.Embedding(block_size, n_embd)
-    # 4 communication channel, 8-D self-attention
-    self.sa_head = MultiHeadAttention(4, n_embd//4)
-    self.ffwd = FeedForward(n_embd)
+    self.blocks = nn.Sequential(
+      *[Block(n_embd, n_head=n_head) for _ in range(n_layer)],
+    )
+    self.ln_f = nn.LayerNorm(n_embd)
     # go from token embed -> logits
     self.lm_head = nn.Linear(n_embd, vocab_size)
 
@@ -143,17 +176,14 @@ class BigramLanguageModel(nn.Module):
     B,T=idx.shape
     # idx and targets are both (B,T) tensor
     tok_embd = self.token_embedding_table(idx) # (B,T,n_embd)
-    pos_embd = self.position_embedding_table(torch.arange(T)) # (T,n_embd)
-    x = tok_embd + pos_embd # (B,T,C), addition works nicely
-    x = self.sa_head(x) # apply one head of self-attention
-    x = self.ffwd(x)
-    # now x hold token identities & positions
-    logits = self.lm_head(x) # (B,T,vocab_size) 
+    pos_embd = self.position_embedding_table(torch.arange(T, device=device)) # (T,n_embd)
+    x = tok_embd + pos_embd
+    x = self.blocks(x)
+    logits = self.lm_head(x) 
 
     if targets is None:
         loss = None
     else:
-        # use built-in -log likelihood loss
         # python wants (B,C,T) instead
         # stretch out into 2D array
         B, T, C = logits.shape
@@ -178,7 +208,8 @@ class BigramLanguageModel(nn.Module):
       # append sampled index to running sequence
       idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
     return idx
-m = BigramLanguageModel()
+model = BigramLanguageModel()
+m = model.to(device)
 
 # 1x1 tensor holding a 0, kickoff character
 idx = torch.zeros((1, 1), dtype=torch.long)
@@ -188,7 +219,6 @@ print(decode(m.generate(idx, max_new_tokens=100)[0].tolist()))
 # time to train!
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 
-# lol lowk just keep running this
 for iter in range(max_iters):
   if iter % eval_interval == 0:
      losses = estimate_loss()
@@ -203,10 +233,10 @@ for iter in range(max_iters):
 # print(loss.item())
 
 # check out improvements to predictions after training
-idx = torch.zeros((1, 1), dtype=torch.long)
+idx = torch.zeros((1, 1), dtype=torch.long, device=device)
 print("="*20+"after training: "+"="*20)
-print(decode(m.generate(idx, max_new_tokens=100)[0].tolist()))
-# tokens still not talking to each other!
-
-
+output = decode(m.generate(idx, max_new_tokens=10000)[0].tolist())
+print(output)
+with open('generated_shakespeare.txt', 'w', encoding='utf-8') as f:
+    f.write(output)
 
