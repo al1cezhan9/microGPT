@@ -19,17 +19,25 @@ class Head(nn.Module):
     self.dropout = nn.Dropout(dropout)
     # tril is not a param of model, it's a buffer
     self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-  def forward(self, x):
+  def forward(self, x, layer_past=None):
     B,T,C = x.shape
     k = self.key(x)
     q = self.query(x)
     v = self.value(x)
+    # KV-caching!!! holy brilliance
+    if layer_past is not None:
+      # concat past KV with current
+      past_k, past_v = layer_past
+      k = torch.cat((past_k, k), dim=1)
+      v = torch.cat((past_v, v), dim=1)
+    # store this for the next token
+    present = (k,v)
     wei = q @ k.transpose(-2, -1) * C**-0.5
     wei = wei.masked_fill(self.tril[:T, :T]==0, float('-inf'))
     wei = F.softmax(wei, dim=-1)
     wei = self.dropout(wei)
     out = wei @ v
-    return out
+    return out, present
   
 class MultiHeadAttention(nn.Module):
   def __init__(self, n_head, head_size):
@@ -38,9 +46,17 @@ class MultiHeadAttention(nn.Module):
     self.heads = nn.ModuleList([Head(head_size) for _ in range(n_head)])
     self.proj = nn.Linear(n_embd, n_embd)
     self.dropout = nn.Dropout(dropout)
-  def forward(self, x):
-    out = torch.cat([h(x) for h in self.heads], dim=-1)
-    return self.dropout(self.proj(out)) # project layer outcome back onto main highway
+  def forward(self, x, layer_past=None):
+    head_outputs = []
+    presents = []
+    for i,h in enumerate(self.heads):
+      past = layer_past[i] if layer_past is not None else None
+      out, present = h(x, layer_past=past)
+      head_outputs.append(out)
+      presents.append(present)
+
+    out = torch.cat(head_outputs, dim=-1)
+    return self.dropout(self.proj(out)), presents # project layer outcome back onto main highway
 
 # done independently on a token-level basis
 class FeedForward(nn.Module):
@@ -63,32 +79,40 @@ class Block(nn.Module):
     self.ffwd = FeedForward(n_embd)
     self.ln1 = nn.LayerNorm(n_embd)
     self.ln2 = nn.LayerNorm(n_embd)
-  def forward(self, x):
+  def forward(self, x, layer_past=None):
+    attn_out, present = self.sa(self.ln1(x), layer_past=layer_past)
     # residual streams enable clean backprop
-    x = x + self.sa(self.ln1(x))
+    x = x + attn_out
     x = x + self.ffwd(self.ln2(x))
-    return x
+    return x, present
   
 class GPT(nn.Module):
-  
   def __init__(self, vocab_size):
     super().__init__()
     self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
     self.position_embedding_table = nn.Embedding(block_size, n_embd)
-    self.blocks = nn.Sequential(
-      *[Block(n_embd, n_head=n_head) for _ in range(n_layer)],
+    self.blocks = nn.ModuleList(
+      [Block(n_embd, n_head=n_head) for _ in range(n_layer)],
     )
     self.ln_f = nn.LayerNorm(n_embd)
     # go from token embed -> logits
     self.lm_head = nn.Linear(n_embd, vocab_size)
 
-  def forward(self, idx, targets=None):
+  def forward(self, idx, targets=None, pasts=None):
     B,T=idx.shape
-    # idx and targets are both (B,T) tensor
-    tok_embd = self.token_embedding_table(idx) # (B,T,n_embd)
-    pos_embd = self.position_embedding_table(torch.arange(T, device=idx.device)) # (T,n_embd)
+    tok_embd = self.token_embedding_table(idx)
+    # adjust position since KV caching will warp this
+    past_length = pasts[0][0].shape[1] if pasts is not None else 0
+    pos_steps = torch.arange(past_length, past_length+T, device=idx.device)
+    pos_embd = self.position_embedding_table(pos_steps)
     x = tok_embd + pos_embd
-    x = self.blocks(x)
+    new_pasts = []
+    # KV-caching
+    for i, block in enumerate(self.blocks):
+      past = pasts[i] if pasts is not None else None
+      x, present = block(x, layer_past=past)
+      new_pasts.append(present)
+    x = self.ln_f(x) # final layer norm
     logits = self.lm_head(x) 
 
     if targets is None:
@@ -100,15 +124,17 @@ class GPT(nn.Module):
         logits = logits.view(B*T, C)
         targets = targets.view(B*T)
         loss = F.cross_entropy(logits, targets)
-    return logits, loss
+    return logits, loss, new_pasts
   
   def generate(self, idx, max_new_tokens, temperature=1.0):
+    # list of caches of each layer
+    pasts = [None] * self.n_layer
     # idx = (B, T) array of indices rn
     for _ in range(max_new_tokens):
-      # crop idx to last block_size token
-      idx_cond = idx[:, -block_size:]
+      # only take very last tok as input since we have cache
+      idx_cond = idx[:, -1:]
       # get predictions
-      logits, loss = self(idx_cond)
+      logits, loss, pasts = self(idx_cond)
       # take only the last time step prediction
       logits = logits[:, -1, :] # becomes (B, C)
       logits = logits / temperature # creativity!
